@@ -2,6 +2,12 @@
 
 A collection of standalone utility scripts for OpenShift / Kubernetes operations and day-to-day platform engineering tasks.
 
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| [ocp-machine-monitor](ocp-machine-monitor/) | Monitor OpenShift Machine provisioning by instance type with Slack notifications |
+
 ## Structure
 
 Each script lives in its own directory with a dedicated README.
