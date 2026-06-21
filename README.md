@@ -7,6 +7,7 @@ A collection of standalone utility scripts for OpenShift / Kubernetes operations
 | Script | Description |
 |--------|-------------|
 | [ocp-machine-monitor](ocp-machine-monitor/) | Monitor OpenShift Machine provisioning by instance type with Slack notifications |
+| [genai-model-validation](genai-model-validation/) | Validate GenAI models (text, TTS, diffusion, omni) deployed on RHOAI via vLLM |
 
 ## Structure
 
