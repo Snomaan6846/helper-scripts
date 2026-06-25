@@ -1,0 +1,6 @@
+# GenAI Model Validation
+genai-model-validation/inputs/*.jpg
+genai-model-validation/inputs/*.wav
+genai-model-validation/inputs/*.mp3
+genai-model-validation/inputs/*.flac
+genai-model-validation/outputs/
