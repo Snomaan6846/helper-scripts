@@ -6,7 +6,6 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 INPUTS_DIR="$BASE_DIR/inputs"
 
 SCENERY_URL="https://upload.wikimedia.org/wikipedia/commons/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
-AURORA_URL="https://upload.wikimedia.org/wikipedia/commons/3/3f/Fronalpstock_big.jpg"
 CAT_URL="https://upload.wikimedia.org/wikipedia/commons/4/4d/Cat_November_2010-1a.jpg"
 
 AUDIO_TEXT="The quick brown fox jumps over the lazy dog"
@@ -49,8 +48,17 @@ download_and_resize() {
     fi
     local tmp="${dest}.tmp"
     echo "FETCH $url"
-    if ! curl -fSL --retry 3 --retry-delay 2 -o "$tmp" "$url"; then
+    if ! curl -fSL --retry 3 --retry-delay 2 --max-time 60 -o "$tmp" "$url"; then
         echo "FAIL  could not download $url"
+        failures+=("$dest")
+        failed+=1
+        return 1
+    fi
+    local dl_size
+    dl_size=$(stat --printf='%s' "$tmp" 2>/dev/null || stat -f '%z' "$tmp" 2>/dev/null)
+    if (( dl_size < 1000 )); then
+        echo "FAIL  $tmp is ${dl_size} bytes (likely truncated or error page)"
+        rm -f "$tmp"
         failures+=("$dest")
         failed+=1
         return 1
@@ -81,7 +89,7 @@ download_raw() {
         return 0
     fi
     echo "FETCH $url"
-    if ! curl -fSL --retry 3 --retry-delay 2 -o "$dest" "$url"; then
+    if ! curl -fSL --retry 3 --retry-delay 2 --max-time 60 -o "$dest" "$url"; then
         echo "FAIL  could not download $url"
         failures+=("$dest")
         failed+=1
@@ -91,6 +99,51 @@ download_raw() {
     size=$(stat --printf='%s' "$dest" 2>/dev/null || stat -f '%z' "$dest" 2>/dev/null)
     if (( size < min_bytes )); then
         echo "FAIL  $dest is ${size} bytes (need >=${min_bytes})"
+        rm -f "$dest"
+        failures+=("$dest")
+        failed+=1
+        return 1
+    fi
+    echo "OK    $dest (${size} bytes)"
+    created+=1
+}
+
+generate_large_image() {
+    local dest="$1"
+    if [[ -f "$dest" && -s "$dest" ]]; then
+        echo "SKIP  $dest (already exists)"
+        skipped+=1
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    local src="$INPUTS_DIR/test-scenery.jpg"
+    if [[ ! -f "$src" ]]; then
+        echo "FAIL  $src not found — needed as source for 4K upscale"
+        failures+=("$dest")
+        failed+=1
+        return 1
+    fi
+    echo "GEN   $dest (upscale test-scenery.jpg to 5120x2880)"
+    if command -v magick &>/dev/null; then
+        magick "$src" -resize 5120x2880^ -gravity center -extent 5120x2880 -quality 100 "$dest"
+    elif command -v convert &>/dev/null; then
+        convert "$src" -resize 5120x2880^ -gravity center -extent 5120x2880 -quality 100 "$dest"
+    else
+        echo "FAIL  ImageMagick (magick/convert) not found — cannot generate large test image"
+        failures+=("$dest")
+        failed+=1
+        return 1
+    fi
+    if [[ ! -f "$dest" ]]; then
+        echo "FAIL  ImageMagick did not produce $dest"
+        failures+=("$dest")
+        failed+=1
+        return 1
+    fi
+    local size
+    size=$(stat --printf='%s' "$dest" 2>/dev/null || stat -f '%z' "$dest" 2>/dev/null)
+    if (( size < 2097152 )); then
+        echo "FAIL  $dest is ${size} bytes (need >=2097152)"
         rm -f "$dest"
         failures+=("$dest")
         failed+=1
@@ -153,7 +206,7 @@ echo "=== Provisioning test inputs into $INPUTS_DIR ==="
 echo
 
 download_and_resize "$SCENERY_URL"  "$INPUTS_DIR/test-scenery.jpg"    1280 720 || true
-download_raw        "$AURORA_URL"   "$INPUTS_DIR/test-scenery-4k.jpg" 2097152  || true
+generate_large_image "$INPUTS_DIR/test-scenery-4k.jpg" || true
 download_and_resize "$CAT_URL"      "$INPUTS_DIR/test-image-2.jpg"    1280 720 || true
 
 generate_audio "$INPUTS_DIR/test-audio-en.wav" || true

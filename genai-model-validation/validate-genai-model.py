@@ -38,6 +38,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import requests
@@ -110,6 +111,7 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "text_stop_sequences",
         "text_logprobs",
         "text_long_context",
+        "text_context_overflow",
         "text_streaming_delta",
         "text_empty_messages",
         "text_invalid_role",
@@ -124,6 +126,9 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "tts_long_text",
         "tts_empty_input",
         "tts_unsupported_voice",
+        "tts_missing_voice",
+        "tts_missing_input",
+        "tts_invalid_format",
         "tts_wav_duration",
         "tts_speed",
         "tts_streaming_audio",
@@ -141,6 +146,8 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "diffusion_guidance_scale",
         "diffusion_invalid_size",
         "diffusion_empty_prompt",
+        "diffusion_missing_prompt",
+        "diffusion_invalid_n",
         "diffusion_url_response",
         "diffusion_num_inference_steps",
     ],
@@ -148,6 +155,9 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "omni_text_chat",
         "omni_completions",
         "omni_vision",
+        "omni_system_vision",
+        "omni_audio_input_chat",
+        "omni_malformed_image",
         "omni_audio_transcription",
         "omni_audio_output",
         "omni_streaming_multimodal",
@@ -158,7 +168,9 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "omni_audio_output_mp3",
         "omni_wav_output_check",
         "omni_modality_combinations",
+        "omni_text_after_audio",
         "omni_large_image",
+        "omni_health_after_large",
         "omni_unsupported_modality",
         "omni_vision_url_vs_base64",
     ],
@@ -173,10 +185,13 @@ NEGATIVE_TESTS = frozenset({
     "common_negative_auth", "common_negative_invalid_model",
     "common_negative_malformed_body", "common_negative_empty_body",
     "common_negative_max_tokens_zero",
-    "text_empty_messages", "text_invalid_role",
+    "text_empty_messages", "text_invalid_role", "text_context_overflow",
     "tts_empty_input", "tts_unsupported_voice",
+    "tts_missing_voice", "tts_missing_input", "tts_invalid_format",
     "diffusion_invalid_size", "diffusion_empty_prompt",
+    "diffusion_missing_prompt", "diffusion_invalid_n",
     "omni_unsupported_modality",
+    "omni_malformed_image",
 })
 
 
@@ -194,6 +209,27 @@ def should_run_test(test_name: str, test_filter: list[str] | None,
     if test_name in ("common_health", "common_models", "common_schema", "common_metadata"):
         return True
     return test_name in test_filter
+
+
+# ── Error Body Validator ──────────────────────────────────────────────────────
+
+
+def validate_error_body(resp, tracker: "ResultTracker", test_label: str) -> None:
+    """Check that a 4xx/5xx response has a valid OpenAI-style error body."""
+    try:
+        body = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        tracker.record(f"{test_label}: error body not JSON", "WARN",
+                       "expected {{error: {{message, type}}}}")
+        return
+    err = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        tracker.record(f"{test_label}: error body missing 'error' key", "WARN",
+                       f"got: {list(body.keys()) if isinstance(body, dict) else type(body).__name__}")
+        return
+    if "message" not in err:
+        tracker.record(f"{test_label}: error.message missing", "WARN",
+                       f"error keys: {list(err.keys())}")
 
 
 # ── Result Tracker ───────────────────────────────────────────────────────────
@@ -643,12 +679,20 @@ def detect_and_rename_image(img_path: Path, base_name: str) -> None:
 
 def parse_wav_duration(filepath: Path) -> float | None:
     """Parse PCM WAV header and return duration in seconds. Returns None if not PCM."""
+    info = parse_wav_info(filepath)
+    return info["duration"] if info else None
+
+
+def parse_wav_info(filepath: Path) -> dict | None:
+    """Parse PCM WAV header. Returns {duration, sample_rate, channels, bits} or None."""
     try:
         with open(filepath, "rb") as f:
             header = f.read(12)
             if header[:4] != MAGIC_RIFF or header[8:12] != b"WAVE":
                 return None
-            # Scan for 'data' chunk starting at byte 12
+            sample_rate = 0
+            num_channels = 0
+            bits_per_sample = 0
             while True:
                 chunk_header = f.read(8)
                 if len(chunk_header) < 8:
@@ -660,21 +704,25 @@ def parse_wav_duration(filepath: Path) -> float | None:
                     if len(fmt_data) < 16:
                         return None
                     audio_format = struct.unpack("<H", fmt_data[0:2])[0]
-                    if audio_format != 1:  # Not PCM
+                    if audio_format != 1:
                         return None
                     num_channels = struct.unpack("<H", fmt_data[2:4])[0]
                     sample_rate = struct.unpack("<I", fmt_data[4:8])[0]
                     bits_per_sample = struct.unpack("<H", fmt_data[14:16])[0]
                 elif chunk_id == b"data":
-                    # Compute duration
                     bytes_per_sample = bits_per_sample // 8
                     if sample_rate == 0 or num_channels == 0 or bytes_per_sample == 0:
                         return None
                     total_samples = chunk_size // (num_channels * bytes_per_sample)
-                    return total_samples / sample_rate
+                    return {
+                        "duration": total_samples / sample_rate,
+                        "sample_rate": sample_rate,
+                        "channels": num_channels,
+                        "bits_per_sample": bits_per_sample,
+                    }
                 else:
                     f.seek(chunk_size, 1)
-    except (OSError, struct.error, UnboundLocalError):
+    except (OSError, struct.error):
         return None
 
 
@@ -814,8 +862,9 @@ def warmup_request(client: HttpClient, endpoint: str, model_name: str,
                 "size": "256x256",
             })
         print(f"{DIM}  Warm-up complete{NC}")
-    except Exception:
-        print(f"  {YELLOW}WARNING: Warm-up request failed, continuing anyway{NC}")
+    except Exception as exc:
+        print(f"  {YELLOW}WARNING: Warm-up request failed ({type(exc).__name__}: {exc}), "
+              f"continuing anyway{NC}")
 
 
 # ── Negative Tests (Common) ──────────────────────────────────────────────────
@@ -871,7 +920,9 @@ def validate_negative_common(client: HttpClient, endpoint: str, model_name: str,
                 insecure=insecure, bearer_token="INVALID_TOKEN_XYZ_000",
                 verbose=verbose, get_timeout=client.get_timeout,
                 post_timeout=client.post_timeout)
-            resp = bad_client.get(f"{endpoint}/v1/models")
+            auth_url = f"{endpoint}{_primary_endpoint(model_type)}"
+            auth_payload = _minimal_valid_payload(model_name, model_type)
+            resp = bad_client.post_json(auth_url, auth_payload)
             if resp is not None and resp.status_code in (401, 403):
                 tracker.record("Negative: auth failure", "PASS",
                                f"HTTP {resp.status_code}")
@@ -882,8 +933,12 @@ def validate_negative_common(client: HttpClient, endpoint: str, model_name: str,
                 tracker.record("Negative: auth failure", "FAIL",
                                f"HTTP {resp.status_code} (expected 4xx)")
             else:
-                tracker.record("Negative: auth failure", "FAIL",
-                               "no auth enforcement detected")
+                if resp is None:
+                    tracker.record("Negative: auth failure", "FAIL",
+                                   "no response (connection error)")
+                else:
+                    tracker.record("Negative: auth failure", "FAIL",
+                                   f"HTTP {resp.status_code} (no auth enforcement)")
         else:
             tracker.record("Negative: auth failure", "SKIP",
                            "BEARER_TOKEN not set")
@@ -896,6 +951,7 @@ def validate_negative_common(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Negative: invalid model", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Negative: invalid model")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Negative: invalid model", "FAIL",
                            f"HTTP {resp.status_code} (expected 4xx)")
@@ -910,6 +966,7 @@ def validate_negative_common(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Negative: malformed body", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Negative: malformed body")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Negative: malformed body", "FAIL",
                            f"HTTP {resp.status_code} (expected 4xx)")
@@ -924,6 +981,7 @@ def validate_negative_common(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Negative: empty body", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Negative: empty body")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Negative: empty body", "FAIL",
                            f"HTTP {resp.status_code} (expected 4xx)")
@@ -954,8 +1012,9 @@ def validate_negative_common(client: HttpClient, endpoint: str, model_name: str,
                     tracker.record("Negative: max_tokens=0", "PASS",
                                    "200 with 0 completion tokens")
                 else:
-                    tracker.record("Negative: max_tokens=0", "PASS",
-                                   "returned empty completion")
+                    tracker.record("Negative: max_tokens=0", "FAIL",
+                                   f"200 with {usage.get('completion_tokens')} "
+                                   "completion_tokens (expected 0)")
             elif resp is not None and resp.status_code >= 500:
                 tracker.record("Negative: max_tokens=0", "FAIL",
                                f"HTTP {resp.status_code} (expected 4xx or empty response)")
@@ -1311,6 +1370,31 @@ def validate_text(client: HttpClient, endpoint: str, model_name: str,
             tracker.record("Long context", "FAIL", f"HTTP {code}",
                            latency_ms=latency)
 
+    # Context overflow (deliberate exceeding of context window)
+    if should_run_test("text_context_overflow", test_filter, skip_negative):
+        print_test("AC: Context overflow (negative)")
+        overflow_text = "word " * 200_000
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": overflow_text}],
+            "max_tokens": 8,
+        }
+        resp = client.post_json(f"{endpoint}/v1/chat/completions", payload,
+                                timeout=30)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Context overflow: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Context overflow")
+        elif resp is not None and resp.status_code >= 500:
+            tracker.record("Context overflow: server error", "FAIL",
+                           f"HTTP {resp.status_code} (should be 4xx, not 5xx)")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Context overflow: accepted", "WARN",
+                           "server accepted oversized context (truncation may apply)")
+        else:
+            tracker.record("Context overflow", "WARN",
+                           "no response (timeout or connection error)")
+
     # Streaming delta validation
     if should_run_test("text_streaming_delta", test_filter, skip_negative):
         print_test("AC: Streaming delta structure")
@@ -1362,6 +1446,7 @@ def validate_text(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Empty messages: returns 4xx", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Empty messages")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Empty messages: returns 4xx", "FAIL",
                            f"HTTP {resp.status_code} (got 5xx)")
@@ -1382,6 +1467,7 @@ def validate_text(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Invalid role: returns 4xx", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Invalid role")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Invalid role: returns 4xx", "FAIL",
                            f"HTTP {resp.status_code} (got 5xx)")
@@ -1627,6 +1713,7 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Empty input: returns 4xx", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Empty input")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Empty input: returns 4xx", "FAIL",
                            f"HTTP {resp.status_code} (got 5xx)")
@@ -1644,6 +1731,7 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Unsupported voice: returns 4xx", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Unsupported voice")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Unsupported voice: returns 4xx", "FAIL",
                            f"HTTP {resp.status_code} (got 5xx)")
@@ -1652,20 +1740,77 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
             tracker.record("Unsupported voice: returns 4xx", "FAIL",
                            f"HTTP {code}")
 
+    # Missing voice field (negative)
+    if should_run_test("tts_missing_voice", test_filter, skip_negative):
+        print_test("AC: Missing voice field (negative)")
+        payload = {"model": model_name, "input": text, "response_format": "wav"}
+        resp = client.post_json(f"{endpoint}/v1/audio/speech", payload)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Missing voice: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Missing voice")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Missing voice: accepted", "WARN",
+                           "server accepted request without voice field")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Missing voice field", "FAIL", f"HTTP {code}")
+
+    # Missing input field (negative)
+    if should_run_test("tts_missing_input", test_filter, skip_negative):
+        print_test("AC: Missing input field (negative)")
+        payload = {"model": model_name, "voice": primary_voice, "response_format": "wav"}
+        resp = client.post_json(f"{endpoint}/v1/audio/speech", payload)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Missing input: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Missing input")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Missing input: accepted", "WARN",
+                           "server accepted request without input field")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Missing input field", "FAIL", f"HTTP {code}")
+
+    # Invalid response_format (negative)
+    if should_run_test("tts_invalid_format", test_filter, skip_negative):
+        print_test("AC: Invalid response_format (negative)")
+        payload = {"model": model_name, "input": text, "voice": primary_voice,
+                   "response_format": "aac_invalid_xyz"}
+        resp = client.post_json(f"{endpoint}/v1/audio/speech", payload)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Invalid format: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Invalid format")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Invalid format: accepted", "WARN",
+                           "server accepted unsupported format without error")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Invalid response_format", "FAIL", f"HTTP {code}")
+
     # WAV duration
     if should_run_test("tts_wav_duration", test_filter, skip_negative):
         print_test("AC: WAV duration check")
         wav_file = output_dir / "speech.wav"
         if wav_file.exists():
-            duration = parse_wav_duration(wav_file)
-            if duration is None:
+            wav_info = parse_wav_info(wav_file)
+            if wav_info is None:
                 tracker.record("WAV duration", "SKIP", "not PCM WAV")
-            elif duration > 1.0:
-                tracker.record("WAV duration >1.0s", "PASS",
-                               f"{duration:.2f}s")
             else:
-                tracker.record("WAV duration >1.0s", "FAIL",
-                               f"{duration:.2f}s")
+                duration = wav_info["duration"]
+                if duration > 1.0:
+                    tracker.record("WAV duration >1.0s", "PASS",
+                                   f"{duration:.2f}s")
+                else:
+                    tracker.record("WAV duration >1.0s", "FAIL",
+                                   f"{duration:.2f}s")
+                sr = wav_info["sample_rate"]
+                if sr in (16000, 22050, 24000, 44100, 48000):
+                    tracker.record("WAV sample rate", "PASS", f"{sr} Hz")
+                else:
+                    tracker.record("WAV sample rate", "WARN",
+                                   f"{sr} Hz (unexpected)")
         else:
             tracker.record("WAV duration", "SKIP", "no WAV file generated")
 
@@ -1707,6 +1852,20 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
             else:
                 tracker.record("Streaming audio: chunked encoding", "WARN",
                                f"Transfer-Encoding: {te or 'not set'}")
+            if stream_file.exists():
+                raw = stream_file.read_bytes()
+                if raw[:4] == MAGIC_RIFF and len(raw) > 44:
+                    tracker.record("Streaming audio: assembled file valid", "PASS",
+                                   f"WAV {len(raw)} bytes")
+                elif is_mp3(stream_file) and len(raw) > 128:
+                    tracker.record("Streaming audio: assembled file valid", "PASS",
+                                   f"MP3 {len(raw)} bytes")
+                elif len(raw) == 0:
+                    tracker.record("Streaming audio: assembled file valid", "FAIL",
+                                   "0 bytes written")
+                else:
+                    tracker.record("Streaming audio: assembled file valid", "WARN",
+                                   f"{len(raw)} bytes, first 4: {raw[:4].hex()}")
         else:
             tracker.record("Streaming audio", "FAIL", f"HTTP {code}")
 
@@ -1829,12 +1988,42 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
                 body = resp.json()
             except (json.JSONDecodeError, ValueError):
                 body = {}
-            if body.get("choices"):
-                tracker.record("Chat image generation", "PASS")
-                save_json(body, output_dir / "chat-image-response.json")
-            else:
+            save_json(body, output_dir / "chat-image-response.json")
+            choices = body.get("choices", [])
+            if not choices:
                 tracker.record("Chat image generation", "FAIL",
                                "no choices in response")
+            else:
+                img_data = None
+                for c in choices:
+                    msg = c.get("message", {})
+                    content = msg.get("content", "")
+                    if content and content.startswith("data:image"):
+                        img_data = content.split(",", 1)[-1] if "," in content else None
+                        break
+                    for part in (msg.get("content") if isinstance(msg.get("content"), list) else []):
+                        if isinstance(part, dict) and part.get("type") == "image_url":
+                            url = part.get("image_url", {}).get("url", "")
+                            if url.startswith("data:image"):
+                                img_data = url.split(",", 1)[-1]
+                                break
+                    if img_data:
+                        break
+                if img_data:
+                    try:
+                        raw = base64.b64decode(img_data)
+                        if raw[:4] in (MAGIC_PNG, MAGIC_JPEG, b"RIFF"):
+                            tracker.record("Chat image generation: valid image", "PASS",
+                                           f"{len(raw)} bytes")
+                        else:
+                            tracker.record("Chat image generation: unknown format",
+                                           "WARN", f"first 4: {raw[:4].hex()}")
+                    except Exception as e:
+                        tracker.record("Chat image generation: decode error",
+                                       "FAIL", str(e))
+                else:
+                    tracker.record("Chat image generation: response OK", "PASS",
+                                   "no inline image data found (text-only response)")
         else:
             code = resp.status_code if resp else 0
             tracker.record("Chat image generation", "SKIP",
@@ -2063,9 +2252,10 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
             "seed": 1,
         }
         resp = client.post_json(f"{endpoint}/v1/images/generations", payload)
-        if resp is not None and 400 <= resp.status_code < 600:
+        if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Invalid size 99x99: rejected", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Invalid size")
         elif resp is not None and 200 <= resp.status_code < 300:
             tracker.record("Invalid size 99x99: rejected", "SKIP",
                            "server accepts arbitrary sizes")
@@ -2084,9 +2274,10 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
             "seed": 1,
         }
         resp = client.post_json(f"{endpoint}/v1/images/generations", payload)
-        if resp is not None and 400 <= resp.status_code < 600:
+        if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Empty prompt: rejected", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Empty prompt")
         elif resp is not None and 200 <= resp.status_code < 300:
             tracker.record("Empty prompt: rejected", "FAIL",
                            "server accepted empty prompt")
@@ -2094,6 +2285,37 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
             code = resp.status_code if resp else 0
             tracker.record("Empty prompt: rejected", "FAIL",
                            f"HTTP {code}")
+
+    # Missing prompt field (negative)
+    if should_run_test("diffusion_missing_prompt", test_filter, skip_negative):
+        print_test("AC: Missing prompt field (negative)")
+        payload = {"model": model_name, "size": "256x256", "seed": 1}
+        resp = client.post_json(f"{endpoint}/v1/images/generations", payload)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Missing prompt: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Missing prompt")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Missing prompt: accepted", "FAIL",
+                           "server accepted request without prompt field")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Missing prompt field", "FAIL", f"HTTP {code}")
+
+    # Invalid n=0 (negative)
+    if should_run_test("diffusion_invalid_n", test_filter, skip_negative):
+        print_test("AC: Invalid n=0 (negative)")
+        payload = {"model": model_name, "prompt": "A dot", "n": 0, "size": "256x256"}
+        resp = client.post_json(f"{endpoint}/v1/images/generations", payload)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Invalid n=0: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Invalid n=0: accepted", "SKIP",
+                           "server accepted n=0 (implementation-specific)")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Invalid n=0", "FAIL", f"HTTP {code}")
 
     # URL response path
     if should_run_test("diffusion_url_response", test_filter, skip_negative):
@@ -2114,19 +2336,23 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
             data = body.get("data", [])
             if data and data[0].get("url"):
                 url_val = data[0]["url"]
-                # Fetch the URL to verify it returns an image
-                img_resp = client.get(url_val)
-                if img_resp is not None and img_resp.status_code == 200:
-                    raw = img_resp.content[:8]
-                    if (raw[:4] == MAGIC_PNG or raw[:3] == MAGIC_JPEG
-                            or raw[:4] == MAGIC_RIFF):
-                        tracker.record("URL response: valid image at URL", "PASS")
-                    else:
-                        tracker.record("URL response: not a known image format",
-                                       "WARN")
-                else:
-                    tracker.record("URL response: could not fetch URL", "WARN",
+                parsed_url = urlparse(url_val)
+                if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+                    tracker.record("URL response: invalid URL", "FAIL",
                                    url_val[:80])
+                else:
+                    img_resp = client.get(url_val)
+                    if img_resp is not None and img_resp.status_code == 200:
+                        raw = img_resp.content[:8]
+                        if (raw[:4] == MAGIC_PNG or raw[:3] == MAGIC_JPEG
+                                or raw[:4] == MAGIC_RIFF):
+                            tracker.record("URL response: valid image at URL", "PASS")
+                        else:
+                            tracker.record("URL response: not a known image format",
+                                           "WARN")
+                    else:
+                        tracker.record("URL response: could not fetch URL", "WARN",
+                                       url_val[:80])
             elif data and data[0].get("b64_json"):
                 tracker.record("URL response format", "SKIP",
                                "model always returns b64_json")
@@ -2171,8 +2397,9 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
                   skip_negative: bool = False) -> None:
     # Prepare image URL (local file preferred, fallback to external)
     image_file = INPUT_DIR / "test-scenery.jpg"
-    external_image_url = ("https://images.unsplash.com/photo-1506744038136-46273834b3fb"
-                          "?w=640&q=80")
+    external_image_url = os.environ.get(
+        "EXTERNAL_IMAGE_URL",
+        "https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=640&q=80")
     if not image_file.exists():
         print(f"  {YELLOW}WARNING: {image_file} not found, vision test will use external URL{NC}")
         image_url = external_image_url
@@ -2222,7 +2449,29 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
                 tracker.record("Text response is non-empty", "FAIL",
                                "empty or too short")
 
-    # /v1/completions
+            # Validate finish_reason and usage (OpenAI contract)
+            choices = body.get("choices", [])
+            if choices:
+                fr = choices[0].get("finish_reason")
+                if fr in ("stop", "length"):
+                    tracker.record("finish_reason present", "PASS", fr)
+                elif fr:
+                    tracker.record("finish_reason present", "WARN",
+                                   f"unexpected value: {fr}")
+                else:
+                    tracker.record("finish_reason present", "WARN", "null/missing")
+            usage = body.get("usage")
+            if isinstance(usage, dict) and usage.get("total_tokens", 0) > 0:
+                tracker.record("usage.total_tokens > 0", "PASS",
+                               f"prompt={usage.get('prompt_tokens')}, "
+                               f"completion={usage.get('completion_tokens')}")
+            elif isinstance(usage, dict):
+                tracker.record("usage.total_tokens > 0", "WARN",
+                               f"total_tokens={usage.get('total_tokens')}")
+            else:
+                tracker.record("usage.total_tokens > 0", "WARN", "usage field missing")
+
+    # /v1/completions (expected: 400 rejection for omni models)
     if should_run_test("omni_completions", test_filter, skip_negative):
         print_test("AC: /v1/completions endpoint")
         payload = {
@@ -2253,7 +2502,7 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
         else:
             code = resp.status_code if resp else 0
             tracker.record("/v1/completions works", "FAIL",
-                           f"HTTP {code} (crashes pod — upstream bug)",
+                           f"HTTP {code} (unexpected server error)",
                            latency_ms=latency)
 
     # Vision
@@ -2284,11 +2533,142 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
             save_json(body, output_dir / "vision-response.json")
             vtext = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
             if vtext and len(vtext) > 10:
+                vision_kw = ["green", "blue", "sky", "grass", "path",
+                             "tree", "nature", "board", "walk", "lake"]
+                found = [k for k in vision_kw if k in vtext.lower()]
                 tracker.record("Vision response describes image", "PASS",
                                f"{len(vtext)} chars", latency_ms=latency)
+                if found:
+                    tracker.record("Vision keywords match", "PASS",
+                                   f"found: {', '.join(found[:5])}")
+                else:
+                    tracker.record("Vision keywords match", "WARN",
+                                   "no expected scenery keywords found")
             else:
                 tracker.record("Vision response describes image", "FAIL",
                                "empty or too short", latency_ms=latency)
+
+    # System prompt + vision (common customer pattern)
+    if should_run_test("omni_system_vision", test_filter, skip_negative):
+        print_test("AC: System prompt + vision input")
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "You are a concise image analyst. "
+                 "Respond with only a comma-separated list of objects you see."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "List the objects in this image."},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]},
+            ],
+            "max_tokens": 64,
+        }
+        resp, latency = timed_call(
+            client.post_json, f"{endpoint}/v1/chat/completions", payload)
+        if resp is not None and 200 <= resp.status_code < 300:
+            try:
+                body = resp.json()
+            except (json.JSONDecodeError, ValueError):
+                body = {}
+            content = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            if content and len(content) > 5:
+                tracker.record("System + vision: response", "PASS",
+                               f"{len(content)} chars", latency_ms=latency)
+            else:
+                tracker.record("System + vision: response", "FAIL",
+                               "empty or too short", latency_ms=latency)
+        elif resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("System + vision", "SKIP",
+                           f"HTTP {resp.status_code}")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("System + vision", "FAIL",
+                           f"HTTP {code}", latency_ms=latency)
+
+    # Audio input via chat (Qwen3-Omni handles audio through chat completions)
+    if should_run_test("omni_audio_input_chat", test_filter, skip_negative):
+        print_test("AC: Audio input via /v1/chat/completions")
+        audio_input = INPUT_DIR / "test-audio-en.wav"
+        if audio_input.exists():
+            audio_b64 = base64.b64encode(audio_input.read_bytes()).decode("ascii")
+            payload = {
+                "model": model_name,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Transcribe this audio."},
+                        {"type": "input_audio",
+                         "input_audio": {"data": audio_b64, "format": "wav"}},
+                    ],
+                }],
+                "max_tokens": 128,
+            }
+            resp, latency = timed_call(
+                client.post_json, f"{endpoint}/v1/chat/completions", payload)
+            if resp is not None and 200 <= resp.status_code < 300:
+                try:
+                    body = resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    body = {}
+                save_json(body, output_dir / "audio-input-chat-response.json")
+                content = ""
+                for c in body.get("choices", []):
+                    txt = c.get("message", {}).get("content", "")
+                    if txt:
+                        content = txt
+                        break
+                keywords = ["quick", "brown", "fox", "lazy", "dog"]
+                found = [kw for kw in keywords if kw in content.lower()]
+                if len(found) >= 3:
+                    tracker.record("Audio input via chat: transcription", "PASS",
+                                   f"keywords: {', '.join(found)}",
+                                   latency_ms=latency)
+                elif content:
+                    tracker.record("Audio input via chat: response", "PASS",
+                                   f"{len(content)} chars (keywords: {', '.join(found)})",
+                                   latency_ms=latency)
+                else:
+                    tracker.record("Audio input via chat", "FAIL",
+                                   "empty response", latency_ms=latency)
+            elif resp is not None and 400 <= resp.status_code < 500:
+                tracker.record("Audio input via chat", "SKIP",
+                               f"HTTP {resp.status_code} (audio input may not be supported)")
+            else:
+                code = resp.status_code if resp else 0
+                tracker.record("Audio input via chat", "FAIL",
+                               f"HTTP {code}", latency_ms=latency)
+        else:
+            tracker.record("Audio input via chat", "SKIP",
+                           "test-audio-en.wav not found")
+
+    # Malformed image input (negative — should not crash)
+    if should_run_test("omni_malformed_image", test_filter, skip_negative):
+        print_test("AC: Malformed image input (negative)")
+        payload = {
+            "model": model_name,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this."},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64,INVALIDBASE64DATA"}},
+                ],
+            }],
+            "max_tokens": 32,
+        }
+        resp = client.post_json(f"{endpoint}/v1/chat/completions", payload)
+        if resp is not None and 400 <= resp.status_code < 500:
+            tracker.record("Malformed image: 4xx rejection", "PASS",
+                           f"HTTP {resp.status_code}")
+        elif resp is not None and resp.status_code >= 500:
+            tracker.record("Malformed image: server error", "FAIL",
+                           f"HTTP {resp.status_code} (should be 4xx, not 5xx)")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Malformed image: accepted", "WARN",
+                           "server accepted invalid base64 without error")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Malformed image", "FAIL", f"HTTP {code}")
 
     # Audio transcription
     if should_run_test("omni_audio_transcription", test_filter, skip_negative):
@@ -2650,7 +3030,24 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
                 payload["audio"] = {"voice": "alloy", "format": "wav"}
             resp = client.post_json(f"{endpoint}/v1/chat/completions", payload)
             if resp is not None and 200 <= resp.status_code < 300:
-                tracker.record(f"Modality [{mod_str}]: 200 OK", "PASS")
+                try:
+                    body = resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    body = {}
+                choices = body.get("choices", [])
+                has_text = any(c.get("message", {}).get("content")
+                               for c in choices)
+                has_audio = any(c.get("message", {}).get("audio", {}).get("data")
+                                for c in choices
+                                if isinstance(c.get("message", {}).get("audio"), dict))
+                if "text" in modality_list and not has_text:
+                    tracker.record(f"Modality [{mod_str}]: text missing", "WARN",
+                                   "200 OK but no text content in response")
+                elif "audio" in modality_list and not has_audio:
+                    tracker.record(f"Modality [{mod_str}]: audio missing", "WARN",
+                                   "200 OK but no audio data in response")
+                else:
+                    tracker.record(f"Modality [{mod_str}]: 200 OK", "PASS")
             elif resp is not None and 400 <= resp.status_code < 500:
                 tracker.record(f"Modality [{mod_str}]", "SKIP",
                                f"HTTP {resp.status_code}")
@@ -2658,6 +3055,40 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
                 code = resp.status_code if resp else 0
                 tracker.record(f"Modality [{mod_str}]", "FAIL",
                                f"HTTP {code}")
+
+    # Text-only request after audio output (cross-modality regression)
+    if should_run_test("omni_text_after_audio", test_filter, skip_negative):
+        print_test("AC: Text-only request after audio output (regression)")
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+            "max_tokens": 32,
+        }
+        resp, latency = timed_call(
+            client.post_json, f"{endpoint}/v1/chat/completions", payload)
+        if resp is not None and 200 <= resp.status_code < 300:
+            try:
+                body = resp.json()
+            except (json.JSONDecodeError, ValueError):
+                body = {}
+            content = (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            if content and "4" in content:
+                tracker.record("Text after audio: correct response", "PASS",
+                               latency_ms=latency)
+            elif content:
+                tracker.record("Text after audio: response received", "PASS",
+                               f"{len(content)} chars", latency_ms=latency)
+            else:
+                tracker.record("Text after audio: empty response", "FAIL",
+                               "possible modality context leak", latency_ms=latency)
+        elif resp is not None and resp.status_code >= 500:
+            tracker.record("Text after audio", "FAIL",
+                           f"HTTP {resp.status_code} (modality state leaked)",
+                           latency_ms=latency)
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Text after audio", "FAIL",
+                           f"HTTP {code}", latency_ms=latency)
 
     # Large image
     if should_run_test("omni_large_image", test_filter, skip_negative):
@@ -2693,6 +3124,20 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
             tracker.record("Large image", "SKIP",
                            "test-scenery-4k.jpg not found or <2MB")
 
+    # Health check after large image — detect zombie state
+    if should_run_test("omni_health_after_large", test_filter, skip_negative):
+        print_test("AC: Health check after large image (zombie detection)")
+        resp = client.get(f"{endpoint}/health")
+        if resp is not None and resp.status_code == 200:
+            tracker.record("Health after large image: 200", "PASS")
+        elif resp is not None and resp.status_code == 503:
+            tracker.record("Health after large image", "FAIL",
+                           "HTTP 503 (engine died — zombie state)")
+        else:
+            code = resp.status_code if resp else 0
+            tracker.record("Health after large image", "FAIL",
+                           f"HTTP {code} (server unhealthy)")
+
     # Unsupported modality
     if should_run_test("omni_unsupported_modality", test_filter, skip_negative):
         print_test("AC: Unsupported modality (video)")
@@ -2706,6 +3151,7 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
         if resp is not None and 400 <= resp.status_code < 500:
             tracker.record("Unsupported modality [video]: rejected", "PASS",
                            f"HTTP {resp.status_code}")
+            validate_error_body(resp, tracker, "Unsupported modality")
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Unsupported modality [video]", "FAIL",
                            f"HTTP {resp.status_code} (expected 4xx)")
@@ -2752,29 +3198,35 @@ def validate_omni(client: HttpClient, endpoint: str, model_name: str,
                 code = resp.status_code if resp else 0
                 tracker.record("Vision base64 input", "FAIL", f"HTTP {code}")
 
-        # HTTP URL test
-        payload = {
-            "model": model_name,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe this."},
-                    {"type": "image_url",
-                     "image_url": {"url": external_image_url}},
-                ],
-            }],
-            "max_tokens": 64,
-        }
-        resp = client.post_json(f"{endpoint}/v1/chat/completions", payload)
-        if resp is not None and 200 <= resp.status_code < 300:
-            tracker.record("Vision HTTP URL input", "PASS")
-        elif resp is not None and 400 <= resp.status_code < 500:
+        # HTTP URL test (skip in air-gapped environments)
+        if not external_image_url:
             tracker.record("Vision HTTP URL input", "SKIP",
-                           f"HTTP {resp.status_code} (connectivity issue or unsupported)")
+                           "no external image URL configured")
         else:
-            code = resp.status_code if resp else 0
-            tracker.record("Vision HTTP URL input", "SKIP",
-                           f"HTTP {code} (connectivity failure)")
+            payload = {
+                "model": model_name,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this."},
+                        {"type": "image_url",
+                         "image_url": {"url": external_image_url}},
+                    ],
+                }],
+                "max_tokens": 64,
+            }
+            resp = client.post_json(f"{endpoint}/v1/chat/completions", payload)
+            if resp is not None and 200 <= resp.status_code < 300:
+                tracker.record("Vision HTTP URL input", "PASS")
+            elif resp is None:
+                tracker.record("Vision HTTP URL input", "SKIP",
+                               "connection failed (air-gapped environment?)")
+            elif 400 <= resp.status_code < 500:
+                tracker.record("Vision HTTP URL input", "SKIP",
+                               f"HTTP {resp.status_code} (URL fetch unsupported)")
+            else:
+                tracker.record("Vision HTTP URL input", "SKIP",
+                               f"HTTP {resp.status_code} (connectivity failure)")
 
 
 
@@ -2908,6 +3360,10 @@ Supported models by type:
 
 Authentication:
   export BEARER_TOKEN="your-token-here"
+
+Environment variables:
+  EXTERNAL_IMAGE_URL=""   # set empty to disable external URL tests (air-gapped envs)
+  EXTERNAL_IMAGE_URL="https://your-cdn/image.jpg"  # override default Unsplash URL
 
 Examples:
   %(prog)s -e https://llama3.apps.cluster.example.com -m llama3 -t text
@@ -3129,10 +3585,15 @@ Examples:
     # Models list (always runs)
     validate_models_list(client, endpoint, model_name, tracker)
 
-    # Runtime metadata (always runs)
-    metadata = capture_runtime_metadata(client, endpoint)
-    if metadata:
-        print(f"\n{DIM}  Runtime metadata: {json.dumps(metadata, default=str)[:200]}{NC}")
+    # Runtime metadata
+    if should_run_test("common_metadata", test_filter, args.skip_negative):
+        metadata = capture_runtime_metadata(client, endpoint)
+        if metadata:
+            print(f"\n{DIM}  Runtime metadata: {json.dumps(metadata, default=str)[:200]}{NC}")
+            for mk, mv in metadata.items():
+                tracker.record(f"Metadata: {mk}", "PASS", str(mv)[:80])
+        else:
+            tracker.record("Metadata: runtime probe", "WARN", "no metadata collected")
 
     # Discover TTS voice early (needed by warm-up and concurrency)
     tts_voice = "alloy"
