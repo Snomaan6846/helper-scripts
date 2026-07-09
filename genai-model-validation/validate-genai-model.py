@@ -1631,7 +1631,7 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
         extra_characters_file = output_dir / "speech-extra-characters.wav"
         extra_characters_payload = {"model": model_name, "input": extra_characters_text, "voice": primary_voice,
                         "response_format": "wav"}
-        (code, _), latency = timed_call(
+        (code, content_type), latency = timed_call(
             client.post_binary, f"{endpoint}/v1/audio/speech", extra_characters_payload, extra_characters_file)
         if not (200 <= code < 300):
             tracker.record("Extra characters in input", "FAIL", f"HTTP {code}",
