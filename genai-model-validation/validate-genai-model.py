@@ -177,7 +177,7 @@ NEGATIVE_TESTS = frozenset({
     "common_negative_max_tokens_zero",
     "text_empty_messages", "text_invalid_role",
     "tts_empty_input", "tts_unsupported_voice",
-    "diffusion_invalid_size", "diffusion_empty_prompt", "diffusion_invalid_num_inference_steps"
+    "diffusion_invalid_size", "diffusion_empty_prompt", "diffusion_invalid_num_inference_steps",
     "omni_unsupported_modality",
 })
 
@@ -699,6 +699,9 @@ def timed_call(fn, *args, **kwargs) -> tuple[Any, float]:
     elapsed = (time.perf_counter() - start) * 1000
     return result, elapsed
 
+
+def is_valid_error_body(body: Any) -> bool:
+    return "error" in body and "message" in body["error"] and "type" in body["error"] and "param" in body["error"] and "code" in body["error"]
 
 # ── Schema Validation ────────────────────────────────────────────────────────
 
@@ -1636,10 +1639,20 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
         else:
             extra_characters_size = extra_characters_file.stat().st_size if extra_characters_file.exists() else 0
             if extra_characters_size > 44:
-                tracker.record("Extra characters in input", "PASS", f"{extra_characters_size} bytes", latency_ms=latency)
+                tracker.record("Response contains audio data", "PASS", f"{extra_characters_size} bytes", latency_ms=latency)
             else:
-                tracker.record("Extra characters in input", "FAIL", f"{extra_characters_size} bytes (too small)", latency_ms=latency)
+                tracker.record("Response contains audio data", "FAIL", f"{extra_characters_size} bytes (too small)", latency_ms=latency)
 
+            if file_magic_check(outfile, MAGIC_RIFF):
+                tracker.record("WAV magic bytes (RIFF)", "PASS")
+            else:
+                tracker.record("WAV magic bytes (RIFF)", "FAIL")
+
+            if check_content_type(content_type, "audio/wav", "audio/x-wav", "audio/wave"):
+                tracker.record("Content-Type header (wav)", "PASS", content_type)
+            else:
+                tracker.record("Content-Type header (wav)", "FAIL",
+                               f"got: {content_type}")
     # Empty input
     if should_run_test("tts_empty_input", test_filter, skip_negative):
         print_test("AC: Empty input (negative)")
@@ -2195,9 +2208,15 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
                 "num_inference_steps": steps,
             }
             resp = client.post_json(f"{endpoint}/v1/images/generations", payload)
-            if resp is not None and 400 <= resp.status_code < 600:
-                tracker.record(f"num_inference_steps={steps}: rejected", "PASS",
-                            f"HTTP {resp.status_code}")
+            if resp is not None and 400 <= resp.status_code < 500:
+                body = resp.json()
+                if is_valid_error_body(body) and body["error"]["param"] == "body.num_inference_steps":
+                    tracker.record(f"num_inference_steps={steps}: rejected", "PASS",
+                        f"HTTP {resp.status_code} and valid error response body")
+                else:
+                    tracker.record(f"num_inference_steps={steps}: rejected", "FAIL",
+                        f"malformed error response body")
+
             elif resp is not None and 200 <= resp.status_code < 300:
                 tracker.record(f"num_inference_steps={steps}: rejected", "FAIL",
                             "server accepted non natural number")
