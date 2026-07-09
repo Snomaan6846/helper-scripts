@@ -122,6 +122,7 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "tts_second_voice",
         "tts_flac",
         "tts_long_text",
+        "tts_extra_characters_text",
         "tts_empty_input",
         "tts_unsupported_voice",
         "tts_wav_duration",
@@ -143,6 +144,7 @@ TEST_REGISTRY: dict[str, list[str]] = {
         "diffusion_empty_prompt",
         "diffusion_url_response",
         "diffusion_num_inference_steps",
+        "diffusion_invalid_num_inference_steps",
     ],
     "omni": [
         "omni_text_chat",
@@ -175,7 +177,7 @@ NEGATIVE_TESTS = frozenset({
     "common_negative_max_tokens_zero",
     "text_empty_messages", "text_invalid_role",
     "tts_empty_input", "tts_unsupported_voice",
-    "diffusion_invalid_size", "diffusion_empty_prompt",
+    "diffusion_invalid_size", "diffusion_empty_prompt", "diffusion_invalid_num_inference_steps",
     "omni_unsupported_modality",
 })
 
@@ -697,6 +699,9 @@ def timed_call(fn, *args, **kwargs) -> tuple[Any, float]:
     elapsed = (time.perf_counter() - start) * 1000
     return result, elapsed
 
+
+def is_valid_error_body(body: Any) -> bool:
+    return "error" in body and "message" in body["error"] and "type" in body["error"] and "param" in body["error"] and "code" in body["error"]
 
 # ── Schema Validation ────────────────────────────────────────────────────────
 
@@ -1618,6 +1623,36 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
         else:
             tracker.record("Long text", "FAIL", f"HTTP {code}", latency_ms=latency)
 
+    
+    # Numbers and characters in input
+    if should_run_test("tts_extra_characters_text", test_filter, skip_negative):
+        print_test("AC: Text input with numbers and extra characters")
+        extra_characters_text = 'Call the sales office @ 555-1234 between 9:30 AM and 5:00 PM for a 15% discount! Offer is only valid until 31/07/2026'
+        extra_characters_file = output_dir / "speech-extra-characters.wav"
+        extra_characters_payload = {"model": model_name, "input": extra_characters_text, "voice": primary_voice,
+                        "response_format": "wav"}
+        (code, content_type), latency = timed_call(
+            client.post_binary, f"{endpoint}/v1/audio/speech", extra_characters_payload, extra_characters_file)
+        if not (200 <= code < 300):
+            tracker.record("Extra characters in input", "FAIL", f"HTTP {code}",
+                           latency_ms=latency)
+        else:
+            extra_characters_size = extra_characters_file.stat().st_size if extra_characters_file.exists() else 0
+            if extra_characters_size > 44:
+                tracker.record("Response contains audio data", "PASS", f"{extra_characters_size} bytes", latency_ms=latency)
+            else:
+                tracker.record("Response contains audio data", "FAIL", f"{extra_characters_size} bytes (too small)", latency_ms=latency)
+
+            if file_magic_check(outfile, MAGIC_RIFF):
+                tracker.record("WAV magic bytes (RIFF)", "PASS")
+            else:
+                tracker.record("WAV magic bytes (RIFF)", "FAIL")
+
+            if check_content_type(content_type, "audio/wav", "audio/x-wav", "audio/wave"):
+                tracker.record("Content-Type header (wav)", "PASS", content_type)
+            else:
+                tracker.record("Content-Type header (wav)", "FAIL",
+                               f"got: {content_type}")
     # Empty input
     if should_run_test("tts_empty_input", test_filter, skip_negative):
         print_test("AC: Empty input (negative)")
@@ -2160,7 +2195,35 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
                 code = resp.status_code if resp else 0
                 tracker.record(f"num_inference_steps={steps}", "FAIL",
                                f"HTTP {code}")
+    
+    # Invalid num_inference_steps
+    if should_run_test("diffusion_invalid_num_inference_steps", test_filter, skip_negative):
+        print_test("AC: Invalid num_inference_steps (negative)")
+        for steps in (0, -1, 1.5):
+            payload = {
+                "model": model_name,
+                "prompt": "A blue circle",
+                "size": "256x256",
+                "seed": 1,
+                "num_inference_steps": steps,
+            }
+            resp = client.post_json(f"{endpoint}/v1/images/generations", payload)
+            if resp is not None and 400 <= resp.status_code < 500:
+                body = resp.json()
+                if is_valid_error_body(body) and body["error"]["param"] == "body.num_inference_steps":
+                    tracker.record(f"num_inference_steps={steps}: rejected", "PASS",
+                        f"HTTP {resp.status_code} and valid error response body")
+                else:
+                    tracker.record(f"num_inference_steps={steps}: rejected", "FAIL",
+                        f"malformed error response body")
 
+            elif resp is not None and 200 <= resp.status_code < 300:
+                tracker.record(f"num_inference_steps={steps}: rejected", "FAIL",
+                            "server accepted non natural number")
+            else:
+                code = resp.status_code if resp else 0
+                tracker.record(f"num_inference_steps={steps}: rejected", "FAIL",
+                            f"HTTP {code}")
 
 # ── Omni Validation ──────────────────────────────────────────────────────────
 
