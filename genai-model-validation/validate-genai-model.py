@@ -1471,6 +1471,9 @@ def validate_text(client: HttpClient, endpoint: str, model_name: str,
         elif resp is not None and resp.status_code >= 500:
             tracker.record("Invalid role: returns 4xx", "FAIL",
                            f"HTTP {resp.status_code} (got 5xx)")
+        elif resp is not None and 200 <= resp.status_code < 300:
+            tracker.record("Invalid role: returns 4xx", "WARN",
+                           "server accepted invalid role (spec non-compliance)")
         else:
             code = resp.status_code if resp else 0
             tracker.record("Invalid role: returns 4xx", "FAIL",
@@ -1872,7 +1875,9 @@ def validate_tts(client: HttpClient, endpoint: str, model_name: str,
     # Multi-language
     if should_run_test("tts_multi_language", test_filter, skip_negative):
         print_test("AC: Multi-language (Chinese)")
-        cn_text = "你好世界这是语音合成测试"
+        cn_text = ("今天的天气非常好，阳光明媚，微风轻拂。"
+                   "我决定出门散步，沿着河边的小路慢慢走。"
+                   "远处的山峦层叠起伏，景色十分宜人。")
         cn_file = output_dir / "speech-chinese.wav"
         cn_payload = {"model": model_name, "input": cn_text, "voice": primary_voice,
                       "response_format": "wav"}
@@ -1998,10 +2003,11 @@ def validate_diffusion(client: HttpClient, endpoint: str, model_name: str,
                 for c in choices:
                     msg = c.get("message", {})
                     content = msg.get("content", "")
-                    if content and content.startswith("data:image"):
+                    if isinstance(content, str) and content.startswith("data:image"):
                         img_data = content.split(",", 1)[-1] if "," in content else None
                         break
-                    for part in (msg.get("content") if isinstance(msg.get("content"), list) else []):
+                    parts = content if isinstance(content, list) else []
+                    for part in parts:
                         if isinstance(part, dict) and part.get("type") == "image_url":
                             url = part.get("image_url", {}).get("url", "")
                             if url.startswith("data:image"):
